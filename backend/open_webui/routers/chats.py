@@ -17,6 +17,9 @@ from open_webui.models.chats import (
     Chats,
     ChatTitleIdResponse,
     SharedChatResponse,
+    SharedChatCountResponse,
+    BatchRevokeSharedChatsRequest,
+    BatchRevokeSharedChatsResponse,
     ChatStatsExport,
     AggregateChatStats,
     ChatBody,
@@ -29,8 +32,8 @@ from open_webui.internal.db import get_session
 
 from open_webui.config import ENABLE_ADMIN_CHAT_ACCESS, ENABLE_ADMIN_EXPORT
 from open_webui.constants import ERROR_MESSAGES
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
+from pydantic import BaseModel, ValidationError
 
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
@@ -775,6 +778,48 @@ async def unarchive_all_chats(user=Depends(get_verified_user), db: Session = Dep
 ############################
 # GetSharedChats
 ############################
+
+
+@router.get('/shared/count', response_model=SharedChatCountResponse)
+async def get_shared_session_user_chat_count(
+    query: Optional[str] = None,
+    user=Depends(get_verified_user),
+    db: Session = Depends(get_session),
+):
+    total = Chats.get_shared_chat_count_by_user_id(user.id, query=query, db=db)
+    return SharedChatCountResponse(total=total)
+
+
+def _batch_revoke_validation_error_detail(exc: ValidationError) -> str:
+    for err in exc.errors():
+        msg = err.get('msg', 'Invalid request')
+        if isinstance(msg, str) and msg.startswith('Value error, '):
+            return msg[len('Value error, ') :]
+        if isinstance(msg, str):
+            return msg
+    return 'Invalid request'
+
+
+@router.post('/shared/revoke', response_model=BatchRevokeSharedChatsResponse)
+async def revoke_shared_chats_batch(
+    user=Depends(get_verified_user),
+    db: Session = Depends(get_session),
+    body: dict = Body(...),
+):
+    try:
+        form = BatchRevokeSharedChatsRequest.model_validate(body)
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_batch_revoke_validation_error_detail(e),
+        )
+    deduped = list(dict.fromkeys(form.ids))
+    if len(deduped) > 200:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='At most 200 unique chat ids are allowed per request',
+        )
+    return Chats.batch_revoke_shared_chats_by_chat_ids(user.id, deduped, db=db)
 
 
 @router.get('/shared', response_model=list[SharedChatResponse])

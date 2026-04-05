@@ -12,7 +12,7 @@ from open_webui.models.chat_messages import ChatMessage, ChatMessages
 from open_webui.models.automations import AutomationRun
 from open_webui.utils.misc import sanitize_data_for_db, sanitize_text_for_db
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -192,6 +192,45 @@ class SharedChatResponse(BaseModel):
     created_at: int
 
 
+class SharedChatCountResponse(BaseModel):
+    total: int
+
+
+class BatchRevokeSharedChatsRequest(BaseModel):
+    """POST /api/v1/chats/shared/revoke — validated in router with HTTP 400 on failure."""
+
+    model_config = ConfigDict(extra='forbid')
+
+    ids: list[str]
+
+    @model_validator(mode='before')
+    @classmethod
+    def validate_ids_shape(cls, data):
+        if not isinstance(data, dict):
+            raise ValueError('Request body must be a JSON object')
+        unknown = set(data.keys()) - {'ids'}
+        if unknown:
+            raise ValueError('Request body must only contain the ids field')
+        if 'ids' not in data:
+            raise ValueError('ids is required')
+        ids = data['ids']
+        if not isinstance(ids, list):
+            raise ValueError('ids must be an array')
+        if len(ids) == 0:
+            raise ValueError('ids must not be empty')
+        for item in ids:
+            if not isinstance(item, str):
+                raise ValueError('ids must be an array of strings')
+        return {'ids': ids}
+
+
+class BatchRevokeSharedChatsResponse(BaseModel):
+    requested: int
+    revoked: int
+    skipped: int
+    failed_ids: list[str] = Field(default_factory=list)
+
+
 class ChatListResponse(BaseModel):
     items: list[ChatModel]
     total: int
@@ -296,6 +335,16 @@ class ChatTable:
                 changed = True
 
         return changed
+
+    @staticmethod
+    def _shared_chats_query_for_user(
+        db: Session, user_id: str, title_query: Optional[str] = None
+    ):
+        """Base query for the current user's shared chats (share_id set), optional title ilike."""
+        q = db.query(Chat).filter_by(user_id=user_id).filter(Chat.share_id.isnot(None))
+        if title_query:
+            q = q.filter(Chat.title.ilike(f'%{title_query}%'))
+        return q
 
     def insert_new_chat(self, user_id: str, form_data: ChatForm, db: Optional[Session] = None) -> Optional[ChatModel]:
         with get_db_context(db) as db:
@@ -626,6 +675,53 @@ class ChatTable:
         except Exception:
             return False
 
+    def batch_revoke_shared_chats_by_chat_ids(
+        self,
+        user_id: str,
+        chat_ids: list[str],
+        db: Optional[Session] = None,
+    ) -> BatchRevokeSharedChatsResponse:
+        deduped = list(dict.fromkeys(chat_ids))
+        requested = len(deduped)
+        revoked = 0
+        skipped = 0
+
+        for chat_id in deduped:
+            try:
+                with get_db_context(db) as session:
+                    chat = session.get(Chat, chat_id)
+                    if chat is None or chat.user_id != user_id:
+                        session.rollback()
+                        skipped += 1
+                        continue
+                    if not chat.share_id:
+                        session.rollback()
+                        skipped += 1
+                        continue
+
+                    shared = session.get(Chat, chat.share_id)
+                    if shared is None or shared.user_id != f'shared-{chat_id}':
+                        session.rollback()
+                        skipped += 1
+                        continue
+
+                    session.query(ChatMessage).filter_by(chat_id=shared.id).delete(
+                        synchronize_session=False
+                    )
+                    session.query(Chat).filter_by(id=shared.id).delete(synchronize_session=False)
+                    chat.share_id = None
+                    session.commit()
+                    revoked += 1
+            except Exception:
+                skipped += 1
+
+        return BatchRevokeSharedChatsResponse(
+            requested=requested,
+            revoked=revoked,
+            skipped=skipped,
+            failed_ids=[],
+        )
+
     def unarchive_all_chats_by_user_id(self, user_id: str, db: Optional[Session] = None) -> bool:
         try:
             with get_db_context(db) as db:
@@ -743,13 +839,15 @@ class ChatTable:
         db: Optional[Session] = None,
     ) -> list[SharedChatResponse]:
         with get_db_context(db) as db:
-            query = db.query(Chat).filter_by(user_id=user_id).filter(Chat.share_id.isnot(None))
-
+            title_query = None
             if filter:
                 query_key = filter.get('query')
                 if query_key:
-                    query = query.filter(Chat.title.ilike(f'%{query_key}%'))
+                    title_query = query_key
 
+            query = self._shared_chats_query_for_user(db, user_id, title_query)
+
+            if filter:
                 order_by = filter.get('order_by')
                 direction = filter.get('direction')
 
@@ -794,6 +892,18 @@ class ChatTable:
                 )
                 for chat in all_chats
             ]
+
+    def get_shared_chat_count_by_user_id(
+        self,
+        user_id: str,
+        query: Optional[str] = None,
+        db: Optional[Session] = None,
+    ) -> int:
+        with get_db_context(db) as db:
+            title_query = query if query else None
+            base = self._shared_chats_query_for_user(db, user_id, title_query)
+            n = base.with_entities(func.count(Chat.id)).order_by(None).scalar()
+            return int(n) if n is not None else 0
 
     def get_chat_list_by_user_id(
         self,
