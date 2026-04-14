@@ -9,9 +9,10 @@ from open_webui.internal.db import Base, JSONField, get_db, get_db_context
 from open_webui.models.tags import TagModel, Tag, Tags
 from open_webui.models.folders import Folders
 from open_webui.models.chat_messages import ChatMessage, ChatMessages
+from open_webui.models.automations import AutomationRun
 from open_webui.utils.misc import sanitize_data_for_db, sanitize_text_for_db
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -54,6 +55,11 @@ class Chat(Base):
     meta = Column(JSON, server_default='{}')
     folder_id = Column(Text, nullable=True)
 
+    tasks = Column(JSON, nullable=True)
+    summary = Column(Text, nullable=True)
+
+    last_read_at = Column(BigInteger, nullable=True)
+
     __table_args__ = (
         # Performance indexes for common queries
         # WHERE folder_id = ...
@@ -86,6 +92,11 @@ class ChatModel(BaseModel):
 
     meta: dict = {}
     folder_id: Optional[str] = None
+
+    tasks: Optional[list] = None
+    summary: Optional[str] = None
+
+    last_read_at: Optional[int] = None
 
 
 class ChatFile(Base):
@@ -161,12 +172,16 @@ class ChatResponse(BaseModel):
     meta: dict = {}
     folder_id: Optional[str] = None
 
+    tasks: Optional[list] = None
+    summary: Optional[str] = None
+
 
 class ChatTitleIdResponse(BaseModel):
     id: str
     title: str
     updated_at: int
     created_at: int
+    last_read_at: Optional[int] = None
 
 
 class SharedChatResponse(BaseModel):
@@ -175,6 +190,45 @@ class SharedChatResponse(BaseModel):
     share_id: Optional[str] = None
     updated_at: int
     created_at: int
+
+
+class SharedChatCountResponse(BaseModel):
+    total: int
+
+
+class BatchRevokeSharedChatsRequest(BaseModel):
+    """POST /api/v1/chats/shared/revoke — validated in router with HTTP 400 on failure."""
+
+    model_config = ConfigDict(extra='forbid')
+
+    ids: list[str]
+
+    @model_validator(mode='before')
+    @classmethod
+    def validate_ids_shape(cls, data):
+        if not isinstance(data, dict):
+            raise ValueError('Request body must be a JSON object')
+        unknown = set(data.keys()) - {'ids'}
+        if unknown:
+            raise ValueError('Request body must only contain the ids field')
+        if 'ids' not in data:
+            raise ValueError('ids is required')
+        ids = data['ids']
+        if not isinstance(ids, list):
+            raise ValueError('ids must be an array')
+        if len(ids) == 0:
+            raise ValueError('ids must not be empty')
+        for item in ids:
+            if not isinstance(item, str):
+                raise ValueError('ids must be an array of strings')
+        return {'ids': ids}
+
+
+class BatchRevokeSharedChatsResponse(BaseModel):
+    requested: int
+    revoked: int
+    skipped: int
+    failed_ids: list[str] = Field(default_factory=list)
 
 
 class ChatListResponse(BaseModel):
@@ -282,6 +336,16 @@ class ChatTable:
 
         return changed
 
+    @staticmethod
+    def _shared_chats_query_for_user(
+        db: Session, user_id: str, title_query: Optional[str] = None
+    ):
+        """Base query for the current user's shared chats (share_id set), optional title ilike."""
+        q = db.query(Chat).filter_by(user_id=user_id).filter(Chat.share_id.isnot(None))
+        if title_query:
+            q = q.filter(Chat.title.ilike(f'%{title_query}%'))
+        return q
+
     def insert_new_chat(self, user_id: str, form_data: ChatForm, db: Optional[Session] = None) -> Optional[ChatModel]:
         with get_db_context(db) as db:
             id = str(uuid.uuid4())
@@ -388,15 +452,33 @@ class ChatTable:
         except Exception:
             return None
 
+    def update_chat_last_read_at_by_id(self, id: str, user_id: str, db: Optional[Session] = None) -> bool:
+        try:
+            with get_db_context(db) as db:
+                chat = db.get(Chat, id)
+                if chat and chat.user_id == user_id:
+                    chat.last_read_at = int(time.time())
+                    db.commit()
+                    return True
+                return False
+        except Exception:
+            return False
+
     def update_chat_title_by_id(self, id: str, title: str) -> Optional[ChatModel]:
-        chat = self.get_chat_by_id(id)
-        if chat is None:
+        try:
+            with get_db_context() as db:
+                chat_item = db.get(Chat, id)
+                if chat_item is None:
+                    return None
+                clean_title = self._clean_null_bytes(title)
+                chat_item.title = clean_title
+                chat_item.chat = {**(chat_item.chat or {}), 'title': clean_title}
+                chat_item.updated_at = int(time.time())
+                db.commit()
+                db.refresh(chat_item)
+                return ChatModel.model_validate(chat_item)
+        except Exception:
             return None
-
-        chat = chat.chat
-        chat['title'] = title
-
-        return self.update_chat_by_id(id, chat)
 
     def update_chat_tags_by_id(self, id: str, tags: list[str], user) -> Optional[ChatModel]:
         with get_db_context() as db:
@@ -593,6 +675,53 @@ class ChatTable:
         except Exception:
             return False
 
+    def batch_revoke_shared_chats_by_chat_ids(
+        self,
+        user_id: str,
+        chat_ids: list[str],
+        db: Optional[Session] = None,
+    ) -> BatchRevokeSharedChatsResponse:
+        deduped = list(dict.fromkeys(chat_ids))
+        requested = len(deduped)
+        revoked = 0
+        skipped = 0
+
+        for chat_id in deduped:
+            try:
+                with get_db_context(db) as session:
+                    chat = session.get(Chat, chat_id)
+                    if chat is None or chat.user_id != user_id:
+                        session.rollback()
+                        skipped += 1
+                        continue
+                    if not chat.share_id:
+                        session.rollback()
+                        skipped += 1
+                        continue
+
+                    shared = session.get(Chat, chat.share_id)
+                    if shared is None or shared.user_id != f'shared-{chat_id}':
+                        session.rollback()
+                        skipped += 1
+                        continue
+
+                    session.query(ChatMessage).filter_by(chat_id=shared.id).delete(
+                        synchronize_session=False
+                    )
+                    session.query(Chat).filter_by(id=shared.id).delete(synchronize_session=False)
+                    chat.share_id = None
+                    session.commit()
+                    revoked += 1
+            except Exception:
+                skipped += 1
+
+        return BatchRevokeSharedChatsResponse(
+            requested=requested,
+            revoked=revoked,
+            skipped=skipped,
+            failed_ids=[],
+        )
+
     def unarchive_all_chats_by_user_id(self, user_id: str, db: Optional[Session] = None) -> bool:
         try:
             with get_db_context(db) as db:
@@ -710,13 +839,15 @@ class ChatTable:
         db: Optional[Session] = None,
     ) -> list[SharedChatResponse]:
         with get_db_context(db) as db:
-            query = db.query(Chat).filter_by(user_id=user_id).filter(Chat.share_id.isnot(None))
-
+            title_query = None
             if filter:
                 query_key = filter.get('query')
                 if query_key:
-                    query = query.filter(Chat.title.ilike(f'%{query_key}%'))
+                    title_query = query_key
 
+            query = self._shared_chats_query_for_user(db, user_id, title_query)
+
+            if filter:
                 order_by = filter.get('order_by')
                 direction = filter.get('direction')
 
@@ -762,6 +893,18 @@ class ChatTable:
                 for chat in all_chats
             ]
 
+    def get_shared_chat_count_by_user_id(
+        self,
+        user_id: str,
+        query: Optional[str] = None,
+        db: Optional[Session] = None,
+    ) -> int:
+        with get_db_context(db) as db:
+            title_query = query if query else None
+            base = self._shared_chats_query_for_user(db, user_id, title_query)
+            n = base.with_entities(func.count(Chat.id)).order_by(None).scalar()
+            return int(n) if n is not None else 0
+
     def get_chat_list_by_user_id(
         self,
         user_id: str,
@@ -770,7 +913,7 @@ class ChatTable:
         skip: int = 0,
         limit: int = 50,
         db: Optional[Session] = None,
-    ) -> list[ChatModel]:
+    ) -> list[ChatTitleIdResponse]:
         with get_db_context(db) as db:
             query = db.query(Chat).filter_by(user_id=user_id)
             if not include_archived:
@@ -794,13 +937,26 @@ class ChatTable:
             else:
                 query = query.order_by(Chat.updated_at.desc(), Chat.id)
 
+            query = query.with_entities(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at)
+
             if skip:
                 query = query.offset(skip)
             if limit:
                 query = query.limit(limit)
 
             all_chats = query.all()
-            return [ChatModel.model_validate(chat) for chat in all_chats]
+            return [
+                ChatTitleIdResponse.model_validate(
+                    {
+                        'id': chat[0],
+                        'title': chat[1],
+                        'updated_at': chat[2],
+                        'created_at': chat[3],
+                        'last_read_at': chat[4],
+                    }
+                )
+                for chat in all_chats
+            ]
 
     def get_chat_title_id_list_by_user_id(
         self,
@@ -825,7 +981,7 @@ class ChatTable:
                 query = query.filter_by(archived=False)
 
             query = query.order_by(Chat.updated_at.desc(), Chat.id).with_entities(
-                Chat.id, Chat.title, Chat.updated_at, Chat.created_at
+                Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at
             )
 
             if skip:
@@ -843,6 +999,7 @@ class ChatTable:
                         'title': chat[1],
                         'updated_at': chat[2],
                         'created_at': chat[3],
+                        'last_read_at': chat[4],
                     }
                 )
                 for chat in all_chats
@@ -986,7 +1143,7 @@ class ChatTable:
                 db.query(Chat)
                 .filter_by(user_id=user_id, pinned=True, archived=False)
                 .order_by(Chat.updated_at.desc())
-                .with_entities(Chat.id, Chat.title, Chat.updated_at, Chat.created_at)
+                .with_entities(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at)
             )
             return [
                 ChatTitleIdResponse.model_validate(
@@ -995,6 +1152,7 @@ class ChatTable:
                         'title': chat[1],
                         'updated_at': chat[2],
                         'created_at': chat[3],
+                        'last_read_at': chat[4],
                     }
                 )
                 for chat in all_chats
@@ -1205,7 +1363,7 @@ class ChatTable:
         skip: int = 0,
         limit: int = 60,
         db: Optional[Session] = None,
-    ) -> list[ChatModel]:
+    ) -> list[ChatTitleIdResponse]:
         with get_db_context(db) as db:
             query = db.query(Chat).filter_by(folder_id=folder_id, user_id=user_id)
             query = query.filter(or_(Chat.pinned == False, Chat.pinned == None))
@@ -1213,13 +1371,26 @@ class ChatTable:
 
             query = query.order_by(Chat.updated_at.desc(), Chat.id)
 
+            query = query.with_entities(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at)
+
             if skip:
                 query = query.offset(skip)
             if limit:
                 query = query.limit(limit)
 
             all_chats = query.all()
-            return [ChatModel.model_validate(chat) for chat in all_chats]
+            return [
+                ChatTitleIdResponse.model_validate(
+                    {
+                        'id': chat[0],
+                        'title': chat[1],
+                        'updated_at': chat[2],
+                        'created_at': chat[3],
+                        'last_read_at': chat[4],
+                    }
+                )
+                for chat in all_chats
+            ]
 
     def get_chats_by_folder_ids_and_user_id(
         self, folder_ids: list[str], user_id: str, db: Optional[Session] = None
@@ -1262,7 +1433,7 @@ class ChatTable:
         skip: int = 0,
         limit: int = 50,
         db: Optional[Session] = None,
-    ) -> list[ChatModel]:
+    ) -> list[ChatTitleIdResponse]:
         with get_db_context(db) as db:
             query = db.query(Chat).filter_by(user_id=user_id)
             tag_id = tag_name.replace(' ', '_').lower()
@@ -1281,9 +1452,28 @@ class ChatTable:
             else:
                 raise NotImplementedError(f'Unsupported dialect: {db.bind.dialect.name}')
 
+            query = query.order_by(Chat.updated_at.desc(), Chat.id)
+
+            query = query.with_entities(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at)
+
+            if skip:
+                query = query.offset(skip)
+            if limit:
+                query = query.limit(limit)
+
             all_chats = query.all()
-            log.debug(f'all_chats: {all_chats}')
-            return [ChatModel.model_validate(chat) for chat in all_chats]
+            return [
+                ChatTitleIdResponse.model_validate(
+                    {
+                        'id': chat[0],
+                        'title': chat[1],
+                        'updated_at': chat[2],
+                        'created_at': chat[3],
+                        'last_read_at': chat[4],
+                    }
+                )
+                for chat in all_chats
+            ]
 
     def add_chat_tag_by_id_and_user_id_and_tag_name(
         self, id: str, user_id: str, tag_name: str, db: Optional[Session] = None
@@ -1393,6 +1583,9 @@ class ChatTable:
     def delete_chat_by_id(self, id: str, db: Optional[Session] = None) -> bool:
         try:
             with get_db_context(db) as db:
+                db.query(AutomationRun).filter_by(chat_id=id).update(
+                    {AutomationRun.chat_id: None}, synchronize_session=False
+                )
                 db.query(ChatMessage).filter_by(chat_id=id).delete()
                 db.query(Chat).filter_by(id=id).delete()
                 db.commit()
@@ -1404,6 +1597,9 @@ class ChatTable:
     def delete_chat_by_id_and_user_id(self, id: str, user_id: str, db: Optional[Session] = None) -> bool:
         try:
             with get_db_context(db) as db:
+                db.query(AutomationRun).filter_by(chat_id=id).update(
+                    {AutomationRun.chat_id: None}, synchronize_session=False
+                )
                 db.query(ChatMessage).filter_by(chat_id=id).delete()
                 db.query(Chat).filter_by(id=id, user_id=user_id).delete()
                 db.commit()
@@ -1418,6 +1614,9 @@ class ChatTable:
                 self.delete_shared_chats_by_user_id(user_id, db=db)
 
                 chat_id_subquery = db.query(Chat.id).filter_by(user_id=user_id).subquery()
+                db.query(AutomationRun).filter(AutomationRun.chat_id.in_(chat_id_subquery)).update(
+                    {AutomationRun.chat_id: None}, synchronize_session=False
+                )
                 db.query(ChatMessage).filter(ChatMessage.chat_id.in_(chat_id_subquery)).delete(
                     synchronize_session=False
                 )
@@ -1432,6 +1631,9 @@ class ChatTable:
         try:
             with get_db_context(db) as db:
                 chat_id_subquery = db.query(Chat.id).filter_by(user_id=user_id, folder_id=folder_id).subquery()
+                db.query(AutomationRun).filter(AutomationRun.chat_id.in_(chat_id_subquery)).update(
+                    {AutomationRun.chat_id: None}, synchronize_session=False
+                )
                 db.query(ChatMessage).filter(ChatMessage.chat_id.in_(chat_id_subquery)).delete(
                     synchronize_session=False
                 )
@@ -1461,8 +1663,8 @@ class ChatTable:
     def delete_shared_chats_by_user_id(self, user_id: str, db: Optional[Session] = None) -> bool:
         try:
             with get_db_context(db) as db:
-                chats_by_user = db.query(Chat).filter_by(user_id=user_id).all()
-                shared_chat_ids = [f'shared-{chat.id}' for chat in chats_by_user]
+                id_rows = db.query(Chat.id).filter_by(user_id=user_id).all()
+                shared_chat_ids = [f'shared-{row[0]}' for row in id_rows]
 
                 # Use subquery to delete chat_messages for shared chats
                 shared_id_subq = db.query(Chat.id).filter(Chat.user_id.in_(shared_chat_ids)).subquery()
@@ -1551,6 +1753,28 @@ class ChatTable:
             )
 
             return [ChatModel.model_validate(chat) for chat in all_chats]
+
+    def update_chat_tasks_by_id(self, id: str, tasks: list[dict]) -> Optional[ChatModel]:
+        """Update the tasks list on a chat."""
+        try:
+            with get_db_context() as db:
+                chat = db.get(Chat, id)
+                if chat is None:
+                    return None
+                chat.tasks = tasks
+                db.commit()
+                db.refresh(chat)
+                return ChatModel.model_validate(chat)
+        except Exception:
+            return None
+
+    def get_chat_tasks_by_id(self, id: str) -> list[dict]:
+        """Read the tasks list from a chat (lightweight column query)."""
+        with get_db_context() as db:
+            result = db.query(Chat.tasks).filter_by(id=id).first()
+            if result is None or result[0] is None:
+                return []
+            return result[0]
 
 
 Chats = ChatTable()
