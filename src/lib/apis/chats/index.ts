@@ -1315,3 +1315,94 @@ export const downloadChatStats = async (
 
 	return [res, controller];
 };
+
+// ============ 成员C 新增：共享聊天管理 API ============
+
+/**
+ * 获取共享聊天列表（支持分页、排序、搜索）
+ */
+export const getSharedChatListV2 = async (
+  token: string,
+  page: number,
+  filters?: {
+    query?: string;
+    order_by?: string;
+    direction?: 'asc' | 'desc';
+  }
+) => {
+  let url = `/api/v1/chats/shared?page=${page}&limit=20`;
+  
+  if (filters?.query) {
+    url += `&query=${encodeURIComponent(filters.query)}`;
+  }
+  if (filters?.order_by) {
+    url += `&order_by=${filters.order_by}`;
+  }
+  if (filters?.direction) {
+    url += `&direction=${filters.direction}`;
+  }
+  
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+  });
+  
+  if (!res.ok) {
+    throw new Error(`Failed to fetch shared chats: ${res.status}`);
+  }
+  
+  return await res.json();
+};
+
+/**
+ * 获取共享聊天总数
+ */
+export const getSharedChatsCount = async (
+  token: string,
+  query?: string
+) => {
+  let url = `/api/v1/chats/shared/count`;
+  if (query) {
+    url += `?query=${encodeURIComponent(query)}`;
+  }
+  
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+  });
+  
+  if (!res.ok) {
+    throw new Error(`Failed to fetch shared chats count: ${res.status}`);
+  }
+  
+  return await res.json();
+};
+
+/**
+ * 批量撤销共享聊天
+ */
+export const revokeSharedChatsBatch = async (
+  token: string,
+  chatIds: string[]
+) => {
+  const res = await fetch(`/api/v1/chats/shared/revoke`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ ids: chatIds }),
+  });
+  
+  if (!res.ok) {
+    throw new Error(`Failed to revoke shared chats: ${res.status}`);
+  }
+  
+  return await res.json();
+};

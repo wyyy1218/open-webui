@@ -2,7 +2,8 @@
 	import type { Writable } from 'svelte/store';
 	import { getContext } from 'svelte';
 	import { toast } from 'svelte-sonner';
-	import { deleteSharedChatById, getSharedChatList } from '$lib/apis/chats';
+	import { deleteSharedChatById, getSharedChatListV2, getSharedChatsCount, revokeSharedChatsBatch } from '$lib/apis/chats';
+	import { selectedChatIds, clearSelection, toggleSelectChat, selectAllOnPage, deselectAllOnPage } from '$lib/stores/sharedChats';
 	import Modal from '$lib/components/common/Modal.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import SharedChatsTable from './SharedChatsTable.svelte';
@@ -20,34 +21,38 @@
 	let chatList: any[] = [];
 	let loading = false;
 	let hasNextPage = false;
-	let selectedChatIds = new Set<string>();
+	let totalCount = 0;
 	let searchDebounceTimeout: ReturnType<typeof setTimeout> | null = null;
 	let requestVersion = 0;
 
 	$: hasPrevPage = page > 1;
-	$: selectedCount = selectedChatIds.size;
-	$: totalOnPage = chatList.length;
+	$: selectedCount = 0;
+	selectedChatIds.subscribe(val => { selectedCount = val.size; });
 
 	const loadChats = async () => {
 		if (!show) return;
 		const currentRequest = ++requestVersion;
 		loading = true;
 
-		const filter = {
-			...(query ? { query } : {}),
-			order_by: orderBy,
-			direction
-		};
+		try {
+			const filters: any = {};
+			if (query) filters.query = query;
+			if (orderBy) filters.order_by = orderBy;
+			if (direction) filters.direction = direction;
 
-		const res = await getSharedChatList(localStorage.token, page, filter).catch((error) => {
-			toast.error(`${error}`);
-			return [];
-		});
-
-		if (currentRequest !== requestVersion) return;
-		chatList = res ?? [];
-		hasNextPage = (res?.length ?? 0) >= PAGE_SIZE;
-		loading = false;
+			const res = await getSharedChatListV2(localStorage.token, page, filters);
+			if (currentRequest !== requestVersion) return;
+			chatList = Array.isArray(res) ? res : (res?.data ?? []);
+			hasNextPage = (chatList.length ?? 0) >= PAGE_SIZE;
+			
+			const countRes = await getSharedChatsCount(localStorage.token, query);
+			if (currentRequest !== requestVersion) return;
+			totalCount = Array.isArray(countRes) ? countRes.length : (countRes?.total ?? 0);
+		} catch (error: any) {
+			toast.error(error.message || 'Failed to load shared chats');
+		} finally {
+			loading = false;
+		}
 	};
 
 	const scheduleLoad = () => {
@@ -68,64 +73,65 @@
 		loadChats();
 	};
 
-	const toggleSelectChat = (chatId: string, checked: boolean) => {
-		const next = new Set(selectedChatIds);
-		if (checked) {
-			next.add(chatId);
-		} else {
-			next.delete(chatId);
-		}
-		selectedChatIds = next;
-	};
-
-	const toggleSelectAllPage = (checked: boolean) => {
-		const next = new Set(selectedChatIds);
-		for (const chat of chatList) {
-			if (checked) {
-				next.add(chat.id);
-			} else {
-				next.delete(chat.id);
-			}
-		}
-		selectedChatIds = next;
-	};
-
 	const unshareSingle = async (chatId: string) => {
 		const res = await deleteSharedChatById(localStorage.token, chatId).catch((error) => {
 			toast.error(`${error}`);
 			return null;
 		});
 		if (res === true) {
-			const next = new Set(selectedChatIds);
-			next.delete(chatId);
-			selectedChatIds = next;
-			toast.success($i18n.t('Chat unshared successfully.'));
+			toast.success('Chat unshared successfully.');
 			onUpdate();
 			loadChats();
 		} else if (res === false) {
-			toast.error($i18n.t('Failed to unshare chat.'));
+			toast.error('Failed to unshare chat.');
 		}
 	};
 
 	const unshareSelected = async () => {
-		if (selectedChatIds.size === 0) return;
-		const selectedIds = [...selectedChatIds];
-		const results = await Promise.all(
-			selectedIds.map((id) => deleteSharedChatById(localStorage.token, id).catch(() => false))
-		);
-		const successCount = results.filter((r) => r === true).length;
-		const failedCount = selectedIds.length - successCount;
-
-		if (successCount > 0) {
-			toast.success($i18n.t('{{count}} chats unshared successfully.', { count: successCount }));
+		let ids: string[] = [];
+		const unsubscribe = selectedChatIds.subscribe(val => { ids = Array.from(val); });
+		unsubscribe();
+		
+		if (ids.length === 0) return;
+		
+		try {
+			await revokeSharedChatsBatch(localStorage.token, ids);
+			toast.success(`${ids.length} chat${ids.length > 1 ? 's' : ''} unshared successfully.`);
+			clearSelection();
+			onUpdate();
+			loadChats();
+		} catch (error: any) {
+			toast.error(error.message || 'Failed to revoke selected chats');
 		}
-		if (failedCount > 0) {
-			toast.error($i18n.t('{{count}} chats failed to unshare.', { count: failedCount }));
-		}
+	};
 
-		selectedChatIds = new Set();
-		onUpdate();
-		loadChats();
+	const toggleSelectChatHandler = (chatId: string, checked: boolean) => {
+		if (checked) {
+			selectedChatIds.update(set => new Set(set).add(chatId));
+		} else {
+			selectedChatIds.update(set => {
+				const newSet = new Set(set);
+				newSet.delete(chatId);
+				return newSet;
+			});
+		}
+	};
+
+	const toggleSelectAllPage = (checked: boolean) => {
+		const chatIds = chatList.map(c => c.id);
+		if (checked) {
+			selectedChatIds.update(set => {
+				const newSet = new Set(set);
+				chatIds.forEach(id => newSet.add(id));
+				return newSet;
+			});
+		} else {
+			selectedChatIds.update(set => {
+				const newSet = new Set(set);
+				chatIds.forEach(id => newSet.delete(id));
+				return newSet;
+			});
+		}
 	};
 
 	const prevPage = () => {
@@ -141,11 +147,8 @@
 	};
 
 	$: if (show) {
-		query;
-		orderBy;
-		direction;
-		page;
-		scheduleLoad();
+		page = 1;
+		loadChats();
 	} else {
 		if (searchDebounceTimeout) {
 			clearTimeout(searchDebounceTimeout);
@@ -153,7 +156,6 @@
 		}
 		page = 1;
 		query = '';
-		selectedChatIds = new Set();
 	}
 </script>
 
@@ -173,7 +175,7 @@
 
 		<div class="flex items-center justify-between gap-3 mb-3">
 			<div class="text-xs text-gray-500 dark:text-gray-400">
-				{$i18n.t('Total')}: {totalOnPage} | {$i18n.t('Selected')}: {selectedCount}
+				{$i18n.t('Total')}: {totalCount} | {$i18n.t('Selected')}: {selectedCount}
 			</div>
 			<div class="flex items-center gap-2">
 				<input
@@ -183,6 +185,7 @@
 					maxlength="500"
 					on:input={() => {
 						page = 1;
+						scheduleLoad();
 					}}
 				/>
 				<button
@@ -195,9 +198,7 @@
 				<button
 					class="px-3 py-1.5 text-xs rounded-lg border border-gray-200 dark:border-gray-800 disabled:opacity-50"
 					disabled={selectedCount === 0 || loading}
-					on:click={() => {
-						selectedChatIds = new Set();
-					}}
+					on:click={clearSelection}
 				>
 					{$i18n.t('Clear Selection')}
 				</button>
@@ -213,10 +214,10 @@
 			{hasNextPage}
 			{orderBy}
 			{direction}
-			{selectedChatIds}
+			selectedChatIds={$selectedChatIds}
 			onToggleSort={setSortKey}
 			onToggleSelectAllPage={toggleSelectAllPage}
-			onToggleSelectChat={toggleSelectChat}
+			onToggleSelectChat={toggleSelectChatHandler}
 			onPrevPage={prevPage}
 			onNextPage={nextPage}
 			onUnshareSingle={unshareSingle}

@@ -1,6 +1,5 @@
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
-
 import { viteStaticCopy } from 'vite-plugin-static-copy';
 
 export default defineConfig({
@@ -9,8 +8,7 @@ export default defineConfig({
 		viteStaticCopy({
 			targets: [
 				{
-					src: 'node_modules/onnxruntime-web/dist/*.jsep.*',
-
+					src: 'node_modules/onnxruntime-web/dist/*.wasm',
 					dest: 'wasm'
 				}
 			]
@@ -28,5 +26,13 @@ export default defineConfig({
 	},
 	esbuild: {
 		pure: process.env.ENV === 'dev' ? [] : ['console.log', 'console.debug', 'console.error']
+	},
+	server: {
+		proxy: {
+			'/api': {
+				target: 'http://localhost:8080',
+				changeOrigin: true
+			}
+		}
 	}
 });
