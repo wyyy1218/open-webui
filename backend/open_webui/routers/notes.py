@@ -81,7 +81,7 @@ async def get_notes(
     limit = None
     skip = None
     if page is not None:
-        limit = 60
+        limit = 20
         skip = (page - 1) * limit
 
     notes = Notes.get_notes_by_user_id(user.id, 'read', skip=skip, limit=limit, db=db)
@@ -127,7 +127,7 @@ async def search_notes(
     limit = None
     skip = None
     if page is not None:
-        limit = 60
+        limit = 20
         skip = (page - 1) * limit
 
     filter = {}

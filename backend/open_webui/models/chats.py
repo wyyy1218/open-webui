@@ -1169,7 +1169,7 @@ class ChatTable:
         search_text: str,
         include_archived: bool = False,
         skip: int = 0,
-        limit: int = 60,
+        limit: int = 20,
         db: Optional[Session] = None,
     ) -> list[ChatModel]:
         """
@@ -1361,7 +1361,7 @@ class ChatTable:
         folder_id: str,
         user_id: str,
         skip: int = 0,
-        limit: int = 60,
+        limit: int = 20,
         db: Optional[Session] = None,
     ) -> list[ChatTitleIdResponse]:
         with get_db_context(db) as db:

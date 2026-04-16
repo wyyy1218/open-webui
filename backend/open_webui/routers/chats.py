@@ -61,7 +61,7 @@ def get_session_user_chat_list(
 ):
     try:
         if page is not None:
-            limit = 60
+            limit = 20
             skip = (page - 1) * limit
 
             return Chats.get_chat_title_id_list_by_user_id(
@@ -530,7 +530,7 @@ async def get_user_chat_list_by_user_id(
     if page is None:
         page = 1
 
-    limit = 60
+    limit = 20
     skip = (page - 1) * limit
 
     filter = {}
@@ -597,7 +597,7 @@ def search_user_chats(
     if page is None:
         page = 1
 
-    limit = 60
+    limit = 20
     skip = (page - 1) * limit
 
     chat_list = [
@@ -735,7 +735,7 @@ async def get_archived_session_user_chat_list(
     if page is None:
         page = 1
 
-    limit = 60
+    limit = 20
     skip = (page - 1) * limit
 
     filter = {}
@@ -834,7 +834,7 @@ async def get_shared_session_user_chat_list(
     if page is None:
         page = 1
 
-    limit = 60
+    limit = 20
     skip = (page - 1) * limit
 
     filter = {}
