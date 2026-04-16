@@ -130,7 +130,12 @@
 
 	<div class="flex items-center justify-between px-4 py-2.5 text-xs border-t border-gray-100 dark:border-gray-850 bg-gray-50/50 dark:bg-gray-900/20">
 		<div class="text-gray-500 dark:text-gray-400">
-			{$i18n.t('Page')} {page} | {$i18n.t('Selected on this page')}: {selectedOnPageCount}
+			{#if $i18n.language === 'zh-CN'}
+				第 {page} 页
+			{:else}
+				{$i18n.t('Page')} {page}
+			{/if}
+			| {$i18n.t('Selected on this page')}: {selectedOnPageCount}
 		</div>
 		<div class="flex items-center gap-2">
 			<button
